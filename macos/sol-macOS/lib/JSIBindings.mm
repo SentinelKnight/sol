@@ -77,35 +77,112 @@ void install(jsi::Runtime &rt,
   });
 
   auto getWifiPassword = HOSTFN("getWifiPassword", []) {
-
-    CLLocationManager *lm = [[CLLocationManager alloc] init];
-    bool location_enabled = [lm locationServicesEnabled];
-
-    if (!location_enabled) {
-      throw std::runtime_error("Location services are not enabled");
+    NSString *ssid = nil;
+    
+    // First try to get SSID using system_profiler (most reliable)
+    NSTask *profilerTask = [[NSTask alloc] init];
+    NSPipe *profilerPipe = [NSPipe pipe];
+    [profilerTask setLaunchPath:@"/usr/sbin/system_profiler"];
+    [profilerTask setArguments:[NSArray arrayWithObjects:@"SPAirPortDataType", @"-json", nil]];
+    [profilerTask setStandardOutput:profilerPipe];
+    
+    NSFileHandle *profilerFile = [profilerPipe fileHandleForReading];
+    [profilerTask launch];
+    [profilerTask waitUntilExit];
+    
+    if ([profilerTask terminationStatus] == 0) {
+      NSData *profilerData = [profilerFile readDataToEndOfFile];
+      NSString *profilerOutput = [[NSString alloc] initWithData:profilerData encoding:NSUTF8StringEncoding];
+      
+      // Parse JSON to find current network
+      NSData *jsonData = [profilerOutput dataUsingEncoding:NSUTF8StringEncoding];
+      NSError *jsonError;
+      NSDictionary *jsonDict = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:&jsonError];
+      
+      if (!jsonError && jsonDict[@"SPAirPortDataType"]) {
+        NSArray *interfaces = jsonDict[@"SPAirPortDataType"];
+        
+        for (NSDictionary *interface in interfaces) {
+          NSArray *airportInterfaces = interface[@"spairport_airport_interfaces"];
+          
+          for (NSDictionary *airportInterface in airportInterfaces) {
+            NSString *interfaceName = airportInterface[@"_name"];
+            
+            NSDictionary *currentNetworkInfo = airportInterface[@"spairport_current_network_information"];
+            
+            if (currentNetworkInfo && currentNetworkInfo[@"_name"]) {
+              NSString *currentNetwork = currentNetworkInfo[@"_name"];
+              if (currentNetwork && [currentNetwork length] > 0) {
+                ssid = currentNetwork;
+                break;
+              }
+            }
+          }
+          if (ssid) break;
+        }
+      } else {
+        NSLog(@"Failed to parse system_profiler Wi-Fi JSON");
+      }
     }
-
-    CLAuthorizationStatus authorization_status = [lm authorizationStatus];
-
-    if (authorization_status == kCLAuthorizationStatusDenied) {
-      throw std::runtime_error("App doesn't have location access");
-    }
-
-    [lm requestAlwaysAuthorization];
-
-    CWWiFiClient *sharedClient = [CWWiFiClient sharedWiFiClient];
-    CWInterface *interface = [sharedClient interface];
-    NSString *ssid = [interface ssid];
+    
+    // If system_profiler failed, try networksetup
     if (!ssid) {
-      throw std::runtime_error("Could not get connected network info");
+      NSArray *wifiInterfaces = @[@"en0", @"en1", @"en2", @"en3"];
+      
+      for (NSString *interface in wifiInterfaces) {
+        NSTask *task = [[NSTask alloc] init];
+        NSPipe *pipe = [NSPipe pipe];
+        [task setLaunchPath:@"/usr/sbin/networksetup"];
+        [task setArguments:[NSArray arrayWithObjects:@"-getairportnetwork", interface, nil]];
+        [task setStandardOutput:pipe];
+        
+        NSFileHandle *file = [pipe fileHandleForReading];
+        [task launch];
+        [task waitUntilExit];
+        
+        NSData *data = [file readDataToEndOfFile];
+        NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        
+        if ([output containsString:@"Current Wi-Fi Network: "]) {
+          ssid = [output stringByReplacingOccurrencesOfString:@"Current Wi-Fi Network: " withString:@""];
+          ssid = [ssid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+          if (ssid && [ssid length] > 0) {
+            break;
+          }
+        }
+      }
     }
+    
+    if (!ssid) {
+      throw std::runtime_error("Could not get connected network info - WiFi may be disconnected");
+    }
+    
+    // Try to get password from keychain using security command
+    NSTask *securityTask = [[NSTask alloc] init];
+    NSPipe *securityPipe = [NSPipe pipe];
+    NSPipe *errorPipe = [NSPipe pipe];
+    [securityTask setLaunchPath:@"/usr/bin/security"];
+    [securityTask setArguments:[NSArray arrayWithObjects:@"find-generic-password", @"-wa", ssid, nil]];
+    [securityTask setStandardOutput:securityPipe];
+    [securityTask setStandardError:errorPipe];
+    
+    NSFileHandle *securityFile = [securityPipe fileHandleForReading];
+    NSFileHandle *errorFile = [errorPipe fileHandleForReading];
+    [securityTask launch];
+    [securityTask waitUntilExit];
+    
     NSString *psk = nil;
-
-    OSStatus status = CWKeychainFindWiFiPassword(
-        kCWKeychainDomainSystem, [ssid dataUsingEncoding:NSUTF8StringEncoding],
-        &psk);
-    if (status != errSecSuccess) {
-      throw std::runtime_error("OS error code: " + std::to_string(status));
+    if ([securityTask terminationStatus] == 0) {
+      NSData *passwordData = [securityFile readDataToEndOfFile];
+      psk = [[NSString alloc] initWithData:passwordData encoding:NSUTF8StringEncoding];
+      psk = [psk stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    } else {
+      NSData *errorData = [errorFile readDataToEndOfFile];
+      NSString *errorOutput = [[NSString alloc] initWithData:errorData encoding:NSUTF8StringEncoding];
+    }
+    
+    if (!psk) {
+      throw std::runtime_error("Could not retrieve WiFi password from keychain");
     }
 
     auto jsi_password = sol::NSStringToJsiValue(rt, psk);
